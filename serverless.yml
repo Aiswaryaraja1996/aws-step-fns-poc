@@ -1,0 +1,159 @@
+service: poc-step-functions
+
+frameworkVersion: "3"
+
+provider:
+  name: aws
+  runtime: python3.9
+  region: ap-south-1
+  iamRoleStatements:
+    - Effect: Allow
+      Action: dynamodb:*
+      Resource: arn:aws:dynamodb:ap-south-1:752671163579:table/Books
+    - Effect: Allow
+      Action: dynamodb:*
+      Resource: arn:aws:dynamodb:ap-south-1:752671163579:table/Users
+    - Effect: Allow
+      Action: sns:*
+      Resource: arn:aws:sns:ap-south-1:752671163579:dispatchOrder
+    - Effect: Allow
+      Action: sqs:*
+      Resource: arn:aws:sqs:ap-south-1:752671163579:OrdersQueue
+    - Effect: Allow
+      Action: states:*
+      Resource: arn:aws:states:ap-south-1:752671163579:execution:storeCheckOutFlow:d7e2e272-5b8c-40ba-80b4-ff232db744e1
+
+functions:
+  checkInventory:
+    handler: handler.checkInventory
+  calculateTotal:
+    handler: handler.calculateTotal
+  redeemPoints:
+    handler: handler.redeemPoints
+  billCustomer:
+    handler: handler.billCustomer
+  restoreRedeemPoints:
+    handler: handler.restoreRedeemPoints
+  restoreQuantity:
+    handler: handler.restoreQuantity
+  sqsWorker:
+    handler: handler.sqsWorker
+    events:
+      - sqs:
+          arn: arn:aws:sqs:ap-south-1:752671163579:OrdersQueue
+          batchSize: 1
+
+stepFunctions:
+  stateMachines:
+    storeCheckOutFlow:
+      name: storeCheckOutFlow
+      definition:
+        StartAt: checkInventory
+        States:
+          checkInventory:
+            Type: Task
+            Resource:
+              Fn::GetAtt: [checkInventory, Arn]
+            Catch:
+              - ErrorEquals: [BookNotFoundException]
+                Next: BookNotFound
+              - ErrorEquals: [BookOuOfStockException]
+                Next: BookOutOfStock
+            ResultPath: "$.book"
+            Next: calculateTotal
+          calculateTotal:
+            Type: Task
+            Resource:
+              Fn::GetAtt: [calculateTotal, Arn]
+            ResultPath: "$.total"
+            Next: isRedeemRequired
+          isRedeemRequired:
+            Type: Choice
+            Choices:
+              - Variable: $.redeem
+                BooleanEquals: true
+                Next: redeemPoints
+            Default: billCustomer
+          redeemPoints:
+            Type: Task
+            Resource:
+              Fn::GetAtt: [redeemPoints, Arn]
+            Catch:
+              - ErrorEquals: [States.ALL]
+                Next: RedeemPointsError
+            ResultPath: "$.total"
+            Next: billCustomer
+          billCustomer:
+            Type: Task
+            Resource:
+              Fn::GetAtt: [billCustomer, Arn]
+            ResultPath: "$.billingStatus"
+            Retry:
+              - ErrorEquals: [States.ALL]
+                MaxAttempts: 3
+            Catch:
+              - ErrorEquals: [States.ALL]
+                ResultPath: "$.billingError"
+                Next: BillingError
+            Next: prepareOrder
+          prepareOrder:
+            Type: Task
+            Resource: arn:aws:states:::sqs:sendMessage.waitForTaskToken
+            Parameters:
+              QueueUrl: https://sqs.ap-south-1.amazonaws.com/752671163579/OrdersQueue
+              MessageBody:
+                Input.$: "$"
+                Token.$: "$$.Task.Token"
+            ResultPath: "$.courierStatus"
+            Catch:
+              - ErrorEquals: [NoCourierAvailable]
+                ResultPath: "$.courierError"
+                Next: RefundCustomer
+            Next: DispatchOrder
+          DispatchOrder:
+            Type: Task
+            Resource: arn:aws:states:::sns:publish
+            Parameters:
+              TopicArn: arn:aws:sns:ap-south-1:752671163579:dispatchOrder
+              Message.$: "$"
+            Next: Dispatched
+          Dispatched:
+            Type: Pass
+            Result: "Your order will be dispatched in 24 hours"
+            End: true
+          RefundCustomer:
+            Type: Pass
+            Result: "Customer is refunded!"
+            ResultPath: "$.refundStatus"
+            Next: restoreQuantity
+          restoreQuantity:
+            Type: Task
+            Resource:
+              Fn::GetAtt: [restoreQuantity, Arn]
+            ResultPath: "$.quantityRestoreStatus"
+            Next: restoreRedeemPoints
+          restoreRedeemPoints:
+            Type: Task
+            Resource:
+              Fn::GetAtt: [restoreRedeemPoints, Arn]
+            End: true
+          BookNotFound:
+            Type: Pass
+            Result: "No Such Book Exists!"
+            End: true
+          BookOutOfStock:
+            Type: Pass
+            Result: "Sorry Book is out of stock!"
+            End: true
+          RedeemPointsError:
+            Type: Pass
+            Result: "Error in redeeming the points!"
+            End: true
+          BillingError:
+            Type: Pass
+            Result: "Error in billing!"
+            ResultPath: "$.billingStatus"
+            Next: restoreRedeemPoints
+
+plugins:
+  - serverless-step-functions
